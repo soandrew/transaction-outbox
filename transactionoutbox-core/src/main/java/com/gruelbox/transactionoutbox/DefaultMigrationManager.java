@@ -32,13 +32,30 @@ class DefaultMigrationManager {
                   + "    attempts INT,\n"
                   + "    blacklisted BOOLEAN,\n"
                   + "    version INT\n"
-                  + ")"),
+                  + ")",
+              Map.of(
+                  Dialect.SQL_SERVER_2012,
+                  "CREATE TABLE TXNO_OUTBOX (\n"
+                      + "    id VARCHAR(36) PRIMARY KEY,\n"
+                      + "    invocation NVARCHAR(MAX),\n"
+                      + "    nextAttemptTime DATETIME2(6),\n"
+                      + "    attempts INT,\n"
+                      + "    blacklisted BIT,\n"
+                      + "    version INT\n"
+                      + ")")),
           new Migration(
               2,
               "Add unique request id",
-              "ALTER TABLE TXNO_OUTBOX ADD COLUMN uniqueRequestId VARCHAR(100) NULL UNIQUE"),
+              "ALTER TABLE TXNO_OUTBOX ADD COLUMN uniqueRequestId VARCHAR(100) NULL UNIQUE",
+              Map.of(
+                  Dialect.SQL_SERVER_2012,
+                  // Unique constraint added in v9. If added here it would not allow multiple nulls.
+                  "ALTER TABLE TXNO_OUTBOX ADD uniqueRequestId VARCHAR(100)")),
           new Migration(
-              3, "Add processed flag", "ALTER TABLE TXNO_OUTBOX ADD COLUMN processed BOOLEAN"),
+              3,
+              "Add processed flag",
+              "ALTER TABLE TXNO_OUTBOX ADD COLUMN processed BOOLEAN",
+              Map.of(Dialect.SQL_SERVER_2012, "ALTER TABLE TXNO_OUTBOX ADD processed BIT")),
           new Migration(
               4,
               "Add flush index",
@@ -51,6 +68,8 @@ class DefaultMigrationManager {
                   Dialect.POSTGRESQL_9,
                   "ALTER TABLE TXNO_OUTBOX ALTER COLUMN uniqueRequestId TYPE VARCHAR(250)",
                   Dialect.H2,
+                  "ALTER TABLE TXNO_OUTBOX ALTER COLUMN uniqueRequestId VARCHAR(250)",
+                  Dialect.SQL_SERVER_2012,
                   "ALTER TABLE TXNO_OUTBOX ALTER COLUMN uniqueRequestId VARCHAR(250)")),
           new Migration(
               6,
@@ -60,25 +79,36 @@ class DefaultMigrationManager {
                   Dialect.POSTGRESQL_9,
                   "ALTER TABLE TXNO_OUTBOX RENAME COLUMN blacklisted TO blocked",
                   Dialect.H2,
-                  "ALTER TABLE TXNO_OUTBOX RENAME COLUMN blacklisted TO blocked")),
+                  "ALTER TABLE TXNO_OUTBOX RENAME COLUMN blacklisted TO blocked",
+                  Dialect.SQL_SERVER_2012,
+                  "EXEC sp_rename 'TXNO_OUTBOX.blacklisted', 'blocked', 'COLUMN'")),
           new Migration(
               7,
               "Add lastAttemptTime column to outbox",
               "ALTER TABLE TXNO_OUTBOX ADD COLUMN lastAttemptTime TIMESTAMP(6) NULL AFTER invocation",
               Map.of(
                   Dialect.POSTGRESQL_9,
-                  "ALTER TABLE TXNO_OUTBOX ADD COLUMN lastAttemptTime TIMESTAMP(6)")),
+                  "ALTER TABLE TXNO_OUTBOX ADD COLUMN lastAttemptTime TIMESTAMP(6)",
+                  Dialect.SQL_SERVER_2012,
+                  "ALTER TABLE TXNO_OUTBOX ADD lastAttemptTime DATETIME2(6)")),
           new Migration(
               8,
               "Update length of invocation column on outbox for MySQL dialects only.",
               "ALTER TABLE TXNO_OUTBOX MODIFY COLUMN invocation MEDIUMTEXT",
-              Map.of(Dialect.POSTGRESQL_9, "", Dialect.H2, "")));
+              Map.of(Dialect.POSTGRESQL_9, "", Dialect.H2, "", Dialect.SQL_SERVER_2012, "")),
+          new Migration(
+              9,
+              "Add unique constraint that allows multiple nulls for uniqueRequestId column on outbox for SQLServer dialects only.",
+              "",
+              Map.of(
+                  Dialect.SQL_SERVER_2012,
+                  "CREATE UNIQUE INDEX UX_TXNO_OUTBOX_uniqueRequestId ON TXNO_OUTBOX (uniqueRequestId) WHERE uniqueRequestId IS NOT NULL")));
 
   static void migrate(TransactionManager transactionManager, @NotNull Dialect dialect) {
     transactionManager.inTransaction(
         transaction -> {
           try {
-            int currentVersion = currentVersion(transaction.connection());
+            int currentVersion = currentVersion(transaction.connection(), dialect);
             MIGRATIONS.stream()
                 .filter(migration -> migration.version > currentVersion)
                 .forEach(migration -> runSql(transaction.connection(), migration, dialect));
@@ -92,17 +122,21 @@ class DefaultMigrationManager {
   private static void runSql(Connection connection, Migration migration, @NotNull Dialect dialect) {
     log.info("Running migration: {}", migration.name);
     try (Statement s = connection.createStatement()) {
-      s.execute(migration.sqlFor(dialect));
+      String sql = migration.sqlFor(dialect);
+      if (sql != null && !sql.isBlank()) {
+        s.execute(sql);
+      }
       if (s.executeUpdate("UPDATE TXNO_VERSION SET version = " + migration.version) != 1) {
         s.execute("INSERT INTO TXNO_VERSION VALUES (" + migration.version + ")");
       }
     }
   }
 
-  private static int currentVersion(Connection connection) throws SQLException {
-    createVersionTableIfNotExists(connection);
+  private static int currentVersion(Connection connection, @NotNull Dialect dialect)
+      throws SQLException {
+    createVersionTableIfNotExists(connection, dialect);
     try (Statement s = connection.createStatement();
-        ResultSet rs = s.executeQuery("SELECT version FROM TXNO_VERSION FOR UPDATE")) {
+        ResultSet rs = s.executeQuery(dialect.getSelectCurrentVersionAndLockTable())) {
       if (!rs.next()) {
         return 0;
       }
@@ -110,10 +144,15 @@ class DefaultMigrationManager {
     }
   }
 
-  private static void createVersionTableIfNotExists(Connection connection) throws SQLException {
+  private static void createVersionTableIfNotExists(Connection connection, @NotNull Dialect dialect)
+      throws SQLException {
     try (Statement s = connection.createStatement()) {
-      // language=MySQL
-      s.execute("CREATE TABLE IF NOT EXISTS TXNO_VERSION (version INT)");
+      s.execute(dialect.getCreateVersionTableIfNotExists());
+      if (dialect == Dialect.SQL_SERVER_2012) {
+        // SQL Server requires DLL to be committed before newly created objects can be referenced
+        // in DML
+        connection.commit();
+      }
     }
   }
 

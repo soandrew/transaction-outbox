@@ -275,7 +275,8 @@ abstract class AbstractDefaultPersistorTest {
 
   @Test
   void testSkipLocked() throws Exception {
-    Assumptions.assumeTrue(dialect().isSupportsSkipLock());
+    // Skip this test for dialects that do not support SKIP LOCKED
+    Assumptions.assumeFalse(dialect() == Dialect.MY_SQL_5 || dialect() == Dialect.H2);
 
     var entry1 = createEntry("FOO1", now.minusSeconds(1), false);
     var entry2 = createEntry("FOO2", now.minusSeconds(1), false);

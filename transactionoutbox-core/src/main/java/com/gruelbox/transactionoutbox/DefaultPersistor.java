@@ -42,8 +42,8 @@ public class DefaultPersistor implements Persistor {
   /**
    * @param writeLockTimeoutSeconds How many seconds to wait before timing out on obtaining a write
    *     lock. There's no point making this long; it's always better to just back off as quickly as
-   *     possible and try another record. Generally these lock timeouts only kick in if {@link
-   *     Dialect#isSupportsSkipLock()} is false.
+   *     possible and try another record. Generally these lock timeouts only kick in if not using
+   *     ({@code SKIP LOCKED}).
    */
   @SuppressWarnings("JavaDoc")
   @Builder.Default
@@ -115,6 +115,11 @@ public class DefaultPersistor implements Persistor {
           throw new AlreadyScheduledException(
               "Request " + entry.description() + " already exists", e);
         }
+        if (e.getClass().getName().equals("com.microsoft.sqlserver.jdbc.SQLServerException")
+            && e.getMessage().contains("duplicate key")) {
+          throw new AlreadyScheduledException(
+              "Request " + entry.description() + " already exists", e);
+        }
         throw e;
       }
     }
@@ -140,7 +145,7 @@ public class DefaultPersistor implements Persistor {
     try (PreparedStatement stmt =
         // language=MySQL
         tx.connection()
-            .prepareStatement("DELETE FROM " + tableName + " WHERE id = ? and version = ?")) {
+            .prepareStatement(dialect.getDeleteEntry().replace("{{table}}", tableName))) {
       stmt.setString(1, entry.getId());
       stmt.setInt(2, entry.getVersion());
       if (stmt.executeUpdate() != 1) {
@@ -183,16 +188,7 @@ public class DefaultPersistor implements Persistor {
   public boolean lock(Transaction tx, TransactionOutboxEntry entry) throws Exception {
     try (PreparedStatement stmt =
         tx.connection()
-            .prepareStatement(
-                dialect.isSupportsSkipLock()
-                    // language=MySQL
-                    ? "SELECT id, invocation FROM "
-                        + tableName
-                        + " WHERE id = ? AND version = ? FOR UPDATE SKIP LOCKED"
-                    // language=MySQL
-                    : "SELECT id, invocation FROM "
-                        + tableName
-                        + " WHERE id = ? AND version = ? FOR UPDATE")) {
+            .prepareStatement(dialect.getSelectAndLockEntry().replace("{{table}}", tableName))) {
       stmt.setString(1, entry.getId());
       stmt.setInt(2, entry.getVersion());
       stmt.setQueryTimeout(writeLockTimeoutSeconds);
@@ -222,9 +218,13 @@ public class DefaultPersistor implements Persistor {
         tx.prepareBatchStatement(
             "UPDATE "
                 + tableName
-                + " SET attempts = 0, blocked = false "
-                + "WHERE blocked = true AND processed = false AND id = ?");
-    stmt.setString(1, entryId);
+                + " SET attempts = ?, blocked = ? "
+                + "WHERE blocked = ? AND processed = ? AND id = ?");
+    stmt.setInt(1, 0);
+    stmt.setBoolean(2, false);
+    stmt.setBoolean(3, true);
+    stmt.setBoolean(4, false);
+    stmt.setString(5, entryId);
     stmt.setQueryTimeout(writeLockTimeoutSeconds);
     return stmt.executeUpdate() != 0;
   }
@@ -232,19 +232,15 @@ public class DefaultPersistor implements Persistor {
   @Override
   public List<TransactionOutboxEntry> selectBatch(Transaction tx, int batchSize, Instant now)
       throws Exception {
-    String forUpdate = dialect.isSupportsSkipLock() ? " FOR UPDATE SKIP LOCKED" : "";
     try (PreparedStatement stmt =
         tx.connection()
             .prepareStatement(
-                // language=MySQL
-                "SELECT "
-                    + ALL_FIELDS
-                    + " FROM "
-                    + tableName
-                    + " WHERE nextAttemptTime < ? AND blocked = false AND processed = false LIMIT ?"
-                    + forUpdate)) {
+                dialect
+                    .getSelectBatchEntries()
+                    .replace("{{fields}}", ALL_FIELDS)
+                    .replace("{{table}}", tableName)
+                    .replace("{{batchSize}}", Integer.toString(batchSize)))) {
       stmt.setTimestamp(1, Timestamp.from(now));
-      stmt.setInt(2, batchSize);
       return gatherResults(batchSize, stmt);
     }
   }
@@ -254,9 +250,12 @@ public class DefaultPersistor implements Persistor {
       throws Exception {
     try (PreparedStatement stmt =
         tx.connection()
-            .prepareStatement(dialect.getDeleteExpired().replace("{{table}}", tableName))) {
+            .prepareStatement(
+                dialect
+                    .getDeleteExpired()
+                    .replace("{{table}}", tableName)
+                    .replace("{{batchSize}}", Integer.toString(batchSize)))) {
       stmt.setTimestamp(1, Timestamp.from(now));
-      stmt.setInt(2, batchSize);
       return stmt.executeUpdate();
     }
   }
@@ -277,9 +276,13 @@ public class DefaultPersistor implements Persistor {
     try (Reader invocationStream = rs.getCharacterStream("invocation")) {
       TransactionOutboxEntry entry =
           TransactionOutboxEntry.builder()
+              // Reading invocationStream *must* occur first because some drivers (ex. SQL Server)
+              // implement true streams that are not buffered in memory. Calling any other getter
+              // on ResultSet before invocationStream is read will cause Reader to be closed
+              // prematurely.
+              .invocation(serializer.deserializeInvocation(invocationStream))
               .id(rs.getString("id"))
               .uniqueRequestId(rs.getString("uniqueRequestId"))
-              .invocation(serializer.deserializeInvocation(invocationStream))
               .lastAttemptTime(
                   rs.getTimestamp("lastAttemptTime") == null
                       ? null
